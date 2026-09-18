@@ -2,7 +2,10 @@
 """CODM Canadian Daily Gift bot - one-shot, headless, standalone."""
 
 import os
+import subprocess
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
 
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
@@ -12,6 +15,7 @@ DAILY_GIFT_HEADING = "DAILY GIFT"
 CLAIM_GIFT_TEXT = "CLAIM GIFT"
 CLAIMED_TEXT = "Claimed"
 SUCCESS_TEXT = "GIFT CLAIMED"
+LOG_FILE = Path(__file__).parent / "run.log"
 
 
 def load_uid() -> str:
@@ -21,6 +25,46 @@ def load_uid() -> str:
         print("Add UID UWU")
         sys.exit(1)
     return uid
+
+
+def log_result(result: str) -> None:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    line = f"{ts} - {result}\n"
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(line)
+    print(line.strip())
+
+
+def git_push_log() -> None:
+    try:
+        subprocess.run(
+            ["git", "add", str(LOG_FILE)],
+            check=True,
+            capture_output=True,
+            timeout=10,
+        )
+        result = subprocess.run(
+            ["git", "diff", "--cached", "--quiet", str(LOG_FILE)],
+            capture_output=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            return
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+        subprocess.run(
+            ["git", "commit", "-m", f"log: {ts}"],
+            check=True,
+            capture_output=True,
+            timeout=10,
+        )
+        subprocess.run(
+            ["git", "push"],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+    except Exception:
+        pass
 
 
 def wait_for_validation(page):
@@ -45,7 +89,7 @@ def is_claimed(card) -> bool:
     return CLAIMED_TEXT in text and CLAIM_GIFT_TEXT not in text
 
 
-def main() -> None:
+def run() -> str:
     uid = load_uid()
     print("Starting CODM Daily Gift bot...")
 
@@ -71,15 +115,12 @@ def main() -> None:
             card.wait_for(state="visible", timeout=15000)
 
             if is_claimed(card):
-                print("Daily Gift already claimed.")
-                print("PASS check inboxie UWU")
-                return
+                return "already claimed"
 
             print("Claiming Daily Gift...")
             claim_el = card.get_by_text(CLAIM_GIFT_TEXT, exact=True)
             if claim_el.count() == 0:
-                print("Claim Gift button could not be found.")
-                sys.exit(1)
+                return "error: Claim Gift button not found"
             claim_el.first.scroll_into_view_if_needed()
             claim_el.first.click(force=True)
 
@@ -88,31 +129,32 @@ def main() -> None:
 
             claim_btn = dialog.locator("[data-testid='claim-button']")
             if claim_btn.count() == 0 or not claim_btn.first.is_visible():
-                print("Claim failed.")
-                sys.exit(1)
+                return "error: Claim button not found in dialog"
             claim_btn.first.click()
 
             claim_btn.wait_for(state="hidden", timeout=15000)
 
             dialog_text = dialog.inner_text()
             if SUCCESS_TEXT in dialog_text:
-                print("Daily Gift claimed successfully.")
-                print("PASS check inboxie UWU")
-                return
-
+                return "claimed successfully"
             if CLAIMED_TEXT in dialog_text and "inbox" in dialog_text.lower():
-                print("Daily Gift claimed successfully.")
-                print("PASS check inboxie UWU")
-                return
+                return "claimed successfully"
 
-            print("Unable to verify claim result.")
-            sys.exit(1)
+            return "error: Unable to verify claim result"
 
         except Exception as exc:
-            print(f"Unexpected store state: {type(exc).__name__}")
-            sys.exit(1)
+            return f"error: {type(exc).__name__}"
         finally:
             browser.close()
+
+
+def main() -> None:
+    result = run()
+    print("PASS check inboxie UWU" if "error" not in result else "")
+    log_result(result)
+    git_push_log()
+    if "error" in result:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
