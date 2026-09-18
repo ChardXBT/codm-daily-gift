@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+artifacts/
+test-results/
+playwright-report/
+*.har
+*.zip
+*.png
+*.webm
