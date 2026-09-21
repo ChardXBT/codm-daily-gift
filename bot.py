@@ -4,6 +4,7 @@
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,6 +17,13 @@ CLAIM_GIFT_TEXT = "CLAIM GIFT"
 CLAIMED_TEXT = "Claimed"
 SUCCESS_TEXT = "GIFT CLAIMED"
 LOG_FILE = Path(__file__).parent / "run.log"
+
+# The store is slow and occasionally stalls on a single step. The log
+# shows a TimeoutError at 02:46:40 and a clean "already claimed" 75
+# seconds later, so a stall is worth one more look rather than a lost
+# day: the job is once-daily and the next attempt is 24 hours away.
+RUN_ATTEMPTS = 3
+RETRY_DELAY_SECONDS = 45
 
 
 def load_uid() -> str:
@@ -89,8 +97,26 @@ def is_claimed(card) -> bool:
     return CLAIMED_TEXT in text and CLAIM_GIFT_TEXT not in text
 
 
+def is_transient(result: str) -> bool:
+    """A stalled step is worth retrying; a missing control is not."""
+    return "TimeoutError" in result
+
+
+def run_with_retries() -> str:
+    for attempt in range(RUN_ATTEMPTS):
+        result = run()
+        if "error" not in result or not is_transient(result):
+            return result
+        if attempt + 1 < RUN_ATTEMPTS:
+            print(f"{result}; retrying in {RETRY_DELAY_SECONDS}s "
+                  f"({attempt + 2}/{RUN_ATTEMPTS})")
+            time.sleep(RETRY_DELAY_SECONDS)
+    return result
+
+
 def run() -> str:
     uid = load_uid()
+    stage = "startup"
     print("Starting CODM Daily Gift bot...")
 
     with sync_playwright() as p:
@@ -98,9 +124,11 @@ def run() -> str:
         try:
             page = browser.new_page()
 
+            stage = "store"
             print("Opening store...")
             page.goto(STORE_URL, wait_until="domcontentloaded", timeout=60000)
 
+            stage = "player_id"
             print("Entering Player ID...")
             uid_field = page.locator("#userId")
             uid_field.wait_for(state="visible", timeout=30000)
@@ -110,6 +138,7 @@ def run() -> str:
 
             wait_for_validation(page)
 
+            stage = "daily_gift_card"
             print("Finding Daily Gift...")
             card = find_daily_gift_card(page)
             card.wait_for(state="visible", timeout=15000)
@@ -117,6 +146,7 @@ def run() -> str:
             if is_claimed(card):
                 return "already claimed"
 
+            stage = "claim"
             print("Claiming Daily Gift...")
             claim_el = card.get_by_text(CLAIM_GIFT_TEXT, exact=True)
             if claim_el.count() == 0:
@@ -143,13 +173,16 @@ def run() -> str:
             return "error: Unable to verify claim result"
 
         except Exception as exc:
-            return f"error: {type(exc).__name__}"
+            # Name the step. "error: TimeoutError" alone never said
+            # whether the store, the ID field, the card or the claim
+            # dialog was the slow one.
+            return f"error: {type(exc).__name__} at {stage}"
         finally:
             browser.close()
 
 
 def main() -> None:
-    result = run()
+    result = run_with_retries()
     print("PASS check inboxie UWU" if "error" not in result else "")
     log_result(result)
     git_push_log()
