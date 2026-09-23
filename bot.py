@@ -98,8 +98,25 @@ def is_claimed(card) -> bool:
 
 
 def is_transient(result: str) -> bool:
-    """A stalled step is worth retrying; a missing control is not."""
-    return "TimeoutError" in result
+    """Retry only stalls that happened before the final Claim request."""
+    return any(
+        result == f"error: TimeoutError at {stage}"
+        for stage in ("store", "player_id", "daily_gift_card", "claim_dialog")
+    )
+
+
+def claim_confirmed(card, dialog) -> bool:
+    """Accept either the store's card state or its confirmation dialog."""
+    try:
+        if is_claimed(card):
+            return True
+    except Exception:
+        pass
+    try:
+        text = dialog.inner_text(timeout=1000)
+    except Exception:
+        return False
+    return SUCCESS_TEXT in text or (CLAIMED_TEXT in text and "inbox" in text.lower())
 
 
 def run_with_retries() -> str:
@@ -146,7 +163,7 @@ def run() -> str:
             if is_claimed(card):
                 return "already claimed"
 
-            stage = "claim"
+            stage = "claim_dialog"
             print("Claiming Daily Gift...")
             claim_el = card.get_by_text(CLAIM_GIFT_TEXT, exact=True)
             if claim_el.count() == 0:
@@ -160,17 +177,16 @@ def run() -> str:
             claim_btn = dialog.locator("[data-testid='claim-button']")
             if claim_btn.count() == 0 or not claim_btn.first.is_visible():
                 return "error: Claim button not found in dialog"
+            # The click may reach the store even when Playwright times out.
+            # From this point on, never submit again without external proof.
+            stage = "claim_submit"
             claim_btn.first.click()
-
-            claim_btn.wait_for(state="hidden", timeout=15000)
-
-            dialog_text = dialog.inner_text()
-            if SUCCESS_TEXT in dialog_text:
-                return "claimed successfully"
-            if CLAIMED_TEXT in dialog_text and "inbox" in dialog_text.lower():
-                return "claimed successfully"
-
-            return "error: Unable to verify claim result"
+            stage = "claim_verification"
+            for _ in range(30):
+                if claim_confirmed(card, dialog):
+                    return "claimed successfully"
+                page.wait_for_timeout(1000)
+            return "error: Claim result unverified after submit"
 
         except Exception as exc:
             # Name the step. "error: TimeoutError" alone never said

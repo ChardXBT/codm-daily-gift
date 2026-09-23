@@ -13,7 +13,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -52,10 +52,10 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(result, "already claimed")
 
     def test_a_persistent_stall_gives_up_and_reports_it(self):
-        stalls = ["error: TimeoutError at claim"] * bot.RUN_ATTEMPTS
+        stalls = ["error: TimeoutError at store"] * bot.RUN_ATTEMPTS
         calls, result = self.run_with(stalls)
         self.assertEqual(calls, bot.RUN_ATTEMPTS)
-        self.assertEqual(result, "error: TimeoutError at claim")
+        self.assertEqual(result, "error: TimeoutError at store")
 
     def test_a_missing_control_is_not_retried(self):
         # Only a stall is transient. If the Claim Gift text is not on the
@@ -69,6 +69,26 @@ class RetryTests(unittest.TestCase):
         # twice on a once-daily gift. Report the ambiguity instead.
         calls, _ = self.run_with(["error: Unable to verify claim result"])
         self.assertEqual(calls, 1)
+
+    def test_a_submit_timeout_is_never_retried(self):
+        for stage in ("claim_submit", "claim_verification"):
+            with self.subTest(stage=stage):
+                calls, result = self.run_with([f"error: TimeoutError at {stage}"])
+                self.assertEqual(calls, 1)
+                self.assertEqual(result, f"error: TimeoutError at {stage}")
+
+    def test_confirmation_text_counts_even_if_button_remains_visible(self):
+        dialog = Mock()
+        dialog.inner_text.return_value = "GIFT CLAIMED"
+        with patch.object(bot, "is_claimed", return_value=False):
+            self.assertTrue(bot.claim_confirmed(Mock(), dialog))
+
+    def test_pre_submit_dialog_stall_remains_retryable(self):
+        calls, result = self.run_with(
+            ["error: TimeoutError at claim_dialog", "already claimed"]
+        )
+        self.assertEqual(calls, 2)
+        self.assertEqual(result, "already claimed")
 
     def test_the_stage_names_where_it_stalled(self):
         # "error: TimeoutError" alone never said which step was slow.
