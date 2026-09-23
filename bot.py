@@ -16,6 +16,13 @@ DAILY_GIFT_HEADING = "DAILY GIFT"
 CLAIM_GIFT_TEXT = "CLAIM GIFT"
 CLAIMED_TEXT = "Claimed"
 SUCCESS_TEXT = "GIFT CLAIMED"
+# The claim dialog is a ".sheet-dialog.freebie-redeem-modal" panel. Its
+# [role='dialog'] wrapper has no box of its own, so Playwright never sees
+# it as visible -- waiting on that is what made every claim time out.
+CLAIM_DIALOG = ".freebie-redeem-modal:has([data-testid='freebie-redeem-modal'])"
+# The card renders "CLAIM GIFT" before the store hydrates the player's
+# claim state; the Claimed overlay can arrive a second or more later.
+CLAIM_STATE_SETTLE_MS = 8000
 LOG_FILE = Path(__file__).parent / "run.log"
 
 # The store is slow and occasionally stalls on a single step. The log
@@ -105,6 +112,19 @@ def is_transient(result: str) -> bool:
     )
 
 
+def dialog_shows_claimed(dialog) -> bool:
+    """The dialog titles itself "Gift Claimed" once the gift is redeemed,
+    whether it was redeemed just now or on an earlier run."""
+    try:
+        text = dialog.inner_text(timeout=1000)
+    except Exception:
+        return False
+    lowered = text.lower()
+    return SUCCESS_TEXT.lower() in lowered or (
+        CLAIMED_TEXT.lower() in lowered and "inbox" in lowered
+    )
+
+
 def claim_confirmed(card, dialog) -> bool:
     """Accept either the store's card state or its confirmation dialog."""
     try:
@@ -112,11 +132,92 @@ def claim_confirmed(card, dialog) -> bool:
             return True
     except Exception:
         pass
+    return dialog_shows_claimed(dialog)
+
+
+def dialog_error(dialog) -> str | None:
+    prompt = dialog.locator("[data-testid='error-prompt']")
     try:
-        text = dialog.inner_text(timeout=1000)
+        if prompt.count() and prompt.first.is_visible():
+            return prompt.first.inner_text(timeout=1000).strip() or "unknown"
     except Exception:
-        return False
-    return SUCCESS_TEXT in text or (CLAIMED_TEXT in text and "inbox" in text.lower())
+        pass
+    return None
+
+
+def wait_for_claim_state(page, card) -> bool:
+    """Give the card time to show a claim the store already recorded."""
+    deadline = time.monotonic() + CLAIM_STATE_SETTLE_MS / 1000
+    while True:
+        if is_claimed(card):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        page.wait_for_timeout(250)
+
+
+def claim_flow(page, uid: str, stage_ref: list[str]) -> str:
+    """Everything after the store page has loaded. stage_ref[0] names the
+    current step so a timeout can be reported (and retried) by stage."""
+    stage_ref[0] = "player_id"
+    print("Entering Player ID...")
+    uid_field = page.locator("#userId")
+    uid_field.wait_for(state="visible", timeout=30000)
+    uid_field.click()
+    uid_field.fill(uid)
+    uid_field.press("Tab")
+
+    wait_for_validation(page)
+
+    stage_ref[0] = "daily_gift_card"
+    print("Finding Daily Gift...")
+    card = find_daily_gift_card(page)
+    card.wait_for(state="visible", timeout=15000)
+
+    if wait_for_claim_state(page, card):
+        return "already claimed"
+
+    stage_ref[0] = "claim_dialog"
+    print("Opening claim dialog...")
+    claim_el = card.get_by_text(CLAIM_GIFT_TEXT, exact=True)
+    if claim_el.count() == 0:
+        return "error: Claim Gift button not found"
+    claim_el.first.scroll_into_view_if_needed()
+    claim_el.first.click(force=True)
+
+    dialog = page.locator(CLAIM_DIALOG).first
+    dialog.wait_for(state="visible", timeout=15000)
+
+    # The dialog opens either offering "CLAIM" or already titled
+    # "Gift Claimed" (a claim the card had not rendered yet).
+    claim_btn = dialog.locator("[data-testid='claim-button']")
+    for _ in range(20):
+        if dialog_shows_claimed(dialog):
+            return "already claimed"
+        if (claim_btn.count() and claim_btn.first.is_visible()
+                and claim_btn.first.is_enabled()):
+            break
+        page.wait_for_timeout(500)
+    else:
+        # Nothing has been submitted yet, so this is safe to retry.
+        raise TimeoutError("claim button never became clickable")
+
+    # The click may reach the store even when Playwright times out.
+    # From this point on, never submit again without external proof.
+    stage_ref[0] = "claim_submit"
+    print("Confirming claim...")
+    claim_btn.first.click()
+    stage_ref[0] = "claim_verification"
+    for _ in range(30):
+        if claim_confirmed(card, dialog):
+            return "claimed successfully"
+        error = dialog_error(dialog)
+        if error:
+            if "already claimed" in error.lower():
+                return "already claimed"
+            return f"error: store rejected claim: {error}"
+        page.wait_for_timeout(1000)
+    return "error: Claim result unverified after submit"
 
 
 def run_with_retries() -> str:
@@ -133,7 +234,7 @@ def run_with_retries() -> str:
 
 def run() -> str:
     uid = load_uid()
-    stage = "startup"
+    stage_ref = ["startup"]
     print("Starting CODM Daily Gift bot...")
 
     with sync_playwright() as p:
@@ -141,58 +242,17 @@ def run() -> str:
         try:
             page = browser.new_page()
 
-            stage = "store"
+            stage_ref[0] = "store"
             print("Opening store...")
             page.goto(STORE_URL, wait_until="domcontentloaded", timeout=60000)
 
-            stage = "player_id"
-            print("Entering Player ID...")
-            uid_field = page.locator("#userId")
-            uid_field.wait_for(state="visible", timeout=30000)
-            uid_field.click()
-            uid_field.fill(uid)
-            uid_field.press("Tab")
-
-            wait_for_validation(page)
-
-            stage = "daily_gift_card"
-            print("Finding Daily Gift...")
-            card = find_daily_gift_card(page)
-            card.wait_for(state="visible", timeout=15000)
-
-            if is_claimed(card):
-                return "already claimed"
-
-            stage = "claim_dialog"
-            print("Claiming Daily Gift...")
-            claim_el = card.get_by_text(CLAIM_GIFT_TEXT, exact=True)
-            if claim_el.count() == 0:
-                return "error: Claim Gift button not found"
-            claim_el.first.scroll_into_view_if_needed()
-            claim_el.first.click(force=True)
-
-            dialog = page.locator("[role='dialog']").first
-            dialog.wait_for(state="visible", timeout=10000)
-
-            claim_btn = dialog.locator("[data-testid='claim-button']")
-            if claim_btn.count() == 0 or not claim_btn.first.is_visible():
-                return "error: Claim button not found in dialog"
-            # The click may reach the store even when Playwright times out.
-            # From this point on, never submit again without external proof.
-            stage = "claim_submit"
-            claim_btn.first.click()
-            stage = "claim_verification"
-            for _ in range(30):
-                if claim_confirmed(card, dialog):
-                    return "claimed successfully"
-                page.wait_for_timeout(1000)
-            return "error: Claim result unverified after submit"
+            return claim_flow(page, uid, stage_ref)
 
         except Exception as exc:
             # Name the step. "error: TimeoutError" alone never said
             # whether the store, the ID field, the card or the claim
             # dialog was the slow one.
-            return f"error: {type(exc).__name__} at {stage}"
+            return f"error: {type(exc).__name__} at {stage_ref[0]}"
         finally:
             browser.close()
 
