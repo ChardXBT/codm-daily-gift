@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -312,6 +313,117 @@ class MainContractTests(unittest.TestCase):
                 bot.main()
             self.assertFalse(lock.exists())
             self.assertIn("already claimed", log.read_text(encoding="utf-8").splitlines()[-1])
+
+    def _run_main_with_lock(self, directory: str, payload: dict, *, age_seconds: float = 0):
+        log, lock = self._paths(directory)
+        lock.write_text(json.dumps(payload), encoding="utf-8")
+        if age_seconds:
+            stamp = time.time() - age_seconds
+            os.utime(lock, (stamp, stamp))
+        before = log.read_text(encoding="utf-8")
+        with (
+            patch.object(bot, "load_uid", return_value="player-test"),
+            patch.object(bot, "run_with_retries", return_value="already claimed"),
+            patch.object(bot, "LOG_FILE", log),
+            patch.object(bot, "LOCK_PATH", lock),
+            patch.object(bot, "git_push_log"),
+            patch.object(
+                bot, "sync_playwright", side_effect=AssertionError("live browser")
+            ),
+        ):
+            try:
+                bot.main()
+            except SystemExit as caught:
+                return caught.code, log.read_text(encoding="utf-8") != before, lock
+        return 0, log.read_text(encoding="utf-8") != before, lock
+
+    @unittest.skipUnless(os.name == "nt", "Windows process identity")
+    def test_a_lock_whose_pid_was_reused_by_another_process_is_replaced(self):
+        # A hard stop leaves artifacts/run.lock behind. Windows recycles pids
+        # quickly, so the next day that pid often belongs to some other live
+        # process. os.kill(pid, 0) only said "a process with this pid exists",
+        # so every launch exited 75 (resource busy, attempt refunded) and the
+        # gift was never claimed again.
+        other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                code, logged, lock = self._run_main_with_lock(
+                    directory, {"pid": other.pid, "created": 1}
+                )
+                self.assertEqual(code, 0)
+                self.assertTrue(logged)
+                self.assertFalse(lock.exists())
+        finally:
+            other.kill()
+            other.wait()
+
+    @unittest.skipUnless(os.name == "nt", "Windows process identity")
+    def test_a_lock_from_an_exited_process_is_replaced_while_its_handle_is_open(self):
+        # The Supervisor keeps a handle to a child it launched. os.kill(pid, 0)
+        # still "succeeds" for such an exited process on Windows.
+        exited = subprocess.Popen([sys.executable, "-c", "pass"])
+        exited.wait()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                code, logged, lock = self._run_main_with_lock(directory, {"pid": exited.pid})
+                self.assertEqual(code, 0)
+                self.assertTrue(logged)
+                self.assertFalse(lock.exists())
+        finally:
+            del exited
+
+    @unittest.skipUnless(os.name == "nt", "Windows process identity")
+    def test_a_lock_held_by_the_recorded_live_process_still_exits_75(self):
+        holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            state, created = bot._process_identity(holder.pid)
+            self.assertEqual(state, "alive")
+            self.assertIsInstance(created, int)
+            with tempfile.TemporaryDirectory() as directory:
+                code, logged, lock = self._run_main_with_lock(
+                    directory, {"pid": holder.pid, "created": created},
+                    age_seconds=3 * 3600,
+                )
+                self.assertEqual(code, 75)
+                self.assertFalse(logged)
+                self.assertTrue(lock.exists())
+        finally:
+            holder.kill()
+            holder.wait()
+
+    def test_a_legacy_lock_with_a_live_pid_is_live_until_it_is_too_old(self):
+        holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                code, logged, _ = self._run_main_with_lock(directory, {"pid": holder.pid})
+                self.assertEqual(code, 75)
+                self.assertFalse(logged)
+            with tempfile.TemporaryDirectory() as directory:
+                code, logged, lock = self._run_main_with_lock(
+                    directory, {"pid": holder.pid},
+                    age_seconds=bot.LOCK_UNVERIFIED_MAX_AGE_SECONDS + 60,
+                )
+                self.assertEqual(code, 0)
+                self.assertTrue(logged)
+                self.assertFalse(lock.exists())
+        finally:
+            holder.kill()
+            holder.wait()
+
+    def test_the_lock_records_this_process_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "run.lock"
+            lock = bot.RunLock(path)
+            self.assertTrue(lock.acquire())
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(raw["pid"], os.getpid())
+                if os.name == "nt":
+                    self.assertEqual(raw["created"], bot._process_identity(os.getpid())[1])
+                self.assertFalse(bot.RunLock(path).acquire())
+            finally:
+                lock.release()
+            self.assertFalse(path.exists())
 
     def test_player_id_comes_from_the_repo_env_file(self):
         with tempfile.TemporaryDirectory() as directory:

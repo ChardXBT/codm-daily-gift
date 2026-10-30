@@ -197,23 +197,80 @@ def git_push_log() -> None:
         pass
 
 
-def _pid_alive(pid: object) -> bool:
-    if type(pid) is not int or pid <= 0:
-        return False
-    if pid == os.getpid():
-        return True
+# A claim run is bounded by its Playwright timeouts and retry sleeps (well
+# under 20 minutes for all three attempts). A lock older than this whose
+# holder cannot be proven to be the process that wrote it is abandoned.
+LOCK_UNVERIFIED_MAX_AGE_SECONDS = 3600
+
+
+def _windows_process_identity(pid: int) -> tuple[str, int | None]:
+    """("alive" | "dead" | "unknown", creation time in 100 ns units).
+
+    os.kill(pid, 0) is not a liveness probe on Windows: signal 0 is
+    CTRL_C_EVENT, and GenerateConsoleCtrlEvent "succeeds" for an exited
+    process whose handle is still open and for any live process, including
+    one that merely reused the pid.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [
+        ctypes.POINTER(wintypes.FILETIME)
+    ] * 4
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    process_query_limited_information = 0x1000
+    synchronize = 0x00100000
+    handle = kernel32.OpenProcess(
+        process_query_limited_information | synchronize, False, pid
+    )
+    if not handle:
+        error = ctypes.get_last_error()
+        # 87: no process has this id. Anything else (5 = access denied)
+        # means a process exists that we cannot inspect.
+        return ("dead", None) if error == 87 else ("unknown", None)
+    try:
+        wait_timeout = 0x102
+        if kernel32.WaitForSingleObject(handle, 0) != wait_timeout:
+            return "dead", None
+        created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+        if not kernel32.GetProcessTimes(
+            handle,
+            ctypes.byref(created),
+            ctypes.byref(exited),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        ):
+            return "alive", None
+        return "alive", (created.dwHighDateTime << 32) | created.dwLowDateTime
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _process_identity(pid: object) -> tuple[str, int | None]:
+    if type(pid) is not int or pid <= 0 or pid > 0xFFFFFFFF:
+        return "dead", None
+    if os.name == "nt":
+        try:
+            return _windows_process_identity(pid)
+        except Exception:
+            # ctypes failures are not OSError. Unknown keeps the lock until
+            # it is old enough that no real claim run can still own it.
+            return "unknown", None
     try:
         os.kill(pid, 0)
     except PermissionError:
-        return True
-    except OSError as exc:
-        # Access denied means some process owns the pid. Treat it as live
-        # so a lock is never stolen from a process we cannot inspect.
-        if getattr(exc, "winerror", None) == 5:
-            return True
-        return False
-    else:
-        return True
+        return "unknown", None
+    except OSError:
+        return "dead", None
+    return "alive", None
 
 
 class RunLock:
@@ -245,16 +302,23 @@ class RunLock:
                     return False
                 continue
             try:
-                os.write(
-                    fd,
-                    json.dumps({"pid": os.getpid()}).encode("utf-8"),
-                )
+                owner: dict[str, int] = {"pid": os.getpid()}
+                created = _process_identity(os.getpid())[1]
+                if created is not None:
+                    owner["created"] = created
+                os.write(fd, json.dumps(owner).encode("utf-8"))
                 os.fsync(fd)
             finally:
                 os.close(fd)
             self._held = True
             return True
         return False
+
+    def _age_seconds(self) -> float | None:
+        try:
+            return time.time() - self.path.stat().st_mtime
+        except OSError:
+            return None
 
     def _stale(self) -> bool:
         try:
@@ -263,14 +327,38 @@ class RunLock:
             # The holder creates the file before the pid write is visible.
             # An empty or half-written lock is live until it is a few
             # seconds old; a crash leaves it stealable after that.
-            try:
-                age = time.time() - self.path.stat().st_mtime
-            except OSError:
-                return True
-            return age > 5
+            age = self._age_seconds()
+            return age is None or age > 5
         if not isinstance(raw, dict):
             return True
-        return not _pid_alive(raw.get("pid"))
+        pid = raw.get("pid")
+        if type(pid) is not int or pid <= 0:
+            return True
+        if pid == os.getpid():
+            return False
+        state, created = _process_identity(pid)
+        if state == "dead":
+            return True
+        recorded = raw.get("created")
+        if state == "alive" and type(recorded) is int and created is not None:
+            # Same pid, different process: the holder died and Windows gave
+            # its pid to someone else.
+            return recorded != created
+        # A live pid we cannot tie to the writer (an older lock without a
+        # creation time, or access denied). A real claim run is long over
+        # once the lock is this old.
+        age = self._age_seconds()
+        return age is None or age > LOCK_UNVERIFIED_MAX_AGE_SECONDS
+
+    def holder_summary(self) -> str:
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            pid = raw.get("pid") if isinstance(raw, dict) else None
+        except (OSError, UnicodeError, ValueError):
+            pid = None
+        age = self._age_seconds()
+        age_text = "unknown" if age is None else f"{age:.0f}s"
+        return f"lock holder pid={pid} age={age_text}"
 
     def release(self) -> None:
         if not self._held:
