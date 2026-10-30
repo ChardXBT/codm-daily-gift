@@ -172,6 +172,7 @@ def git_push_log() -> None:
     commit touches another file, because that push would publish it too.
     """
     repo = LOG_FILE.resolve().parent
+    step = "diff"
     try:
         diff = _git(
             repo,
@@ -180,6 +181,7 @@ def git_push_log() -> None:
             check=False,
         )
         if diff.returncode == 1:
+            step = "commit"
             ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
             _git(
                 repo,
@@ -188,13 +190,19 @@ def git_push_log() -> None:
                 check=True,
             )
         elif diff.returncode != 0:
+            print(f"run.log publish skipped: git diff exit {diff.returncode}")
             return
         # The log commit may sit on an unpublished code commit. Pushing
         # then would publish that code. Publish only a run.log history.
+        step = "push"
         if _unpushed_log_only(repo):
             _git(repo, ["push"], 30, check=True)
-    except Exception:
-        pass
+    except Exception as exc:
+        # stdout only, and never git's own text: it can name the remote.
+        # A failed push stays local and is retried after the next result.
+        code = getattr(exc, "returncode", None)
+        suffix = f" exit {code}" if isinstance(code, int) else ""
+        print(f"run.log publish failed at {step}: {type(exc).__name__}{suffix}")
 
 
 # A claim run is bounded by its Playwright timeouts and retry sleeps (well
@@ -736,12 +744,31 @@ def run() -> str:
         return failure_line(exc, stage_ref[0], uid=uid)
 
 
+def startup_line() -> str:
+    """stdout only: run.log is the Supervisor's result file and stays one
+    result per line."""
+    try:
+        head = _git(
+            LOG_FILE.resolve().parent, ["rev-parse", "HEAD"], 10, check=False
+        )
+        sha = head.stdout.strip()[:12] if head.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        sha = ""
+    return (
+        f"codm-daily-gift start: git={sha or 'unknown'} pid={os.getpid()} "
+        f"headless=True attempts={RUN_ATTEMPTS} "
+        f"retry_delay={RETRY_DELAY_SECONDS}s"
+    )
+
+
 def main() -> None:
+    print(startup_line())
     lock = RunLock(LOCK_PATH)
     if not lock.acquire():
         # No run.log line: an "error:" line would repair-latch the job
         # while the holder is still claiming.
         print("another claim run is active")
+        print(lock.holder_summary())
         raise SystemExit(75)
     code = 0
     try:

@@ -661,6 +661,57 @@ class GitPublicationTests(unittest.TestCase):
             self.assertEqual(remote, published)
 
 
+class StartupAndPublishLoggingTests(unittest.TestCase):
+    def test_startup_line_names_the_commit_and_never_the_player_id(self):
+        with patch.dict(os.environ, {"CODM_UID": "9990001"}, clear=False):
+            line = bot.startup_line()
+        self.assertTrue(line.startswith("codm-daily-gift start: git="), line)
+        self.assertIn(f"pid={os.getpid()}", line)
+        self.assertIn(f"attempts={bot.RUN_ATTEMPTS}", line)
+        self.assertNotIn("9990001", line)
+        for marker in ("error:", "Add UID UWU", "Traceback", *bot.SUPERVISOR_TRANSIENT_MARKERS):
+            self.assertNotIn(marker, line)
+
+    def test_a_failed_log_push_says_so_on_stdout_without_git_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = GitPublicationTests()._repo(root)
+            bare = root / "bare.git"
+            subprocess.run(
+                ["git", "init", "--bare", "-b", "master", str(bare)],
+                check=True, capture_output=True,
+            )
+            subprocess.run(
+                ["git", "remote", "add", "origin", str(bare)],
+                cwd=repo, check=True, capture_output=True,
+            )
+            subprocess.run(
+                ["git", "push", "-u", "origin", "HEAD"],
+                cwd=repo, check=True, capture_output=True,
+            )
+            # The remote disappears: the push of the new log line fails.
+            subprocess.run(
+                ["git", "remote", "set-url", "origin", str(root / "missing.git")],
+                cwd=repo, check=True, capture_output=True,
+            )
+            log = repo / "run.log"
+            log.write_text(
+                log.read_text(encoding="utf-8") + "2026-10-30 03:00:00 UTC - already claimed\n",
+                encoding="utf-8",
+            )
+            with (
+                patch.object(bot, "LOG_FILE", log),
+                patch("builtins.print") as printed,
+            ):
+                bot.git_push_log()
+            lines = [" ".join(map(str, call.args)) for call in printed.call_args_list]
+            failures = [line for line in lines if line.startswith("run.log publish failed")]
+            self.assertEqual(len(failures), 1, lines)
+            self.assertIn("at push", failures[0])
+            self.assertNotIn("missing.git", failures[0])
+            self.assertEqual(log.read_text(encoding="utf-8").count("\n"), 2)
+
+
 class LatchTests(unittest.TestCase):
     def test_a_corrupt_latch_blocks_the_submit(self):
         with tempfile.TemporaryDirectory() as directory:
