@@ -14,8 +14,11 @@ Run with:  .venv/Scripts/python.exe -m unittest discover -s tests
 
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -48,6 +51,12 @@ STORE = """
 <script>
   window.claims = 0;
   const mode = new URLSearchParams(location.hash.slice(1)).get("mode");
+  if (mode === "two-cards" || mode === "hidden-template") {
+    const clone = document.getElementById("card").cloneNode(true);
+    clone.id = mode === "two-cards" ? "card-b" : "card-hidden";
+    if (mode === "hidden-template") clone.style.display = "none";
+    document.getElementById("card").after(clone);
+  }
   const markClaimed = () => {
     const overlay = document.createElement("div");
     overlay.dataset.testid = "purchased-overlay";
@@ -73,10 +82,12 @@ STORE = """
     window.claims += 1;
     e.target.disabled = true;
     setTimeout(() => {
-      if (mode === "rejected") {
+      if (mode === "rejected" || mode === "rejected-newline") {
         const err = document.createElement("span");
         err.dataset.testid = "error-prompt";
-        err.textContent = "Sorry, you are not eligible to claim this item.";
+        err.textContent = mode === "rejected-newline"
+          ? "nope\\n2026-01-01 00:00:00 UTC - claimed successfully"
+          : "Sorry, you are not eligible to claim this item.";
         document.getElementById("footer").prepend(err);
         return;
       }
@@ -99,7 +110,7 @@ class ClaimFlowTests(unittest.TestCase):
         cls.browser.close()
         cls.pw.stop()
 
-    def flow(self, mode: str):
+    def flow(self, mode: str, latch: Path | None = None):
         page = self.browser.new_page()
         self.addCleanup(page.close)
         page.route("https://store.test/**", lambda route: route.fulfill(
@@ -107,7 +118,7 @@ class ClaimFlowTests(unittest.TestCase):
         page.goto(f"https://store.test/codm#mode={mode}")
         stage = ["store"]
         with patch.object(bot, "CLAIM_STATE_SETTLE_MS", 3000):
-            result = bot.claim_flow(page, "123", stage)
+            result = bot.claim_flow(page, "123", stage, latch_path=latch)
         return result, page.evaluate("window.claims"), stage[0]
 
     def test_unclaimed_gift_is_claimed_once_and_verified(self):
@@ -134,6 +145,65 @@ class ClaimFlowTests(unittest.TestCase):
         self.assertEqual(claims, 1)
         self.assertFalse(bot.is_transient(result))
         self.assertEqual(stage, "claim_verification")
+
+    def test_store_error_cannot_inject_a_second_log_line(self):
+        # The rejection text is copied into run.log. A newline plus a
+        # fake "claimed successfully" line would satisfy the Supervisor.
+        result, claims, _ = self.flow("rejected-newline")
+        self.assertEqual(claims, 1)
+        self.assertNotIn("\n", result)
+        self.assertNotIn("claimed successfully", result)
+        self.assertNotIn("TimeoutError", result)
+        self.assertTrue(result.startswith("error: store rejected claim"), result)
+        self.assertFalse(bot.is_transient(result))
+
+    def test_two_visible_daily_gift_cards_are_not_clicked(self):
+        result, claims, _ = self.flow("two-cards")
+        self.assertEqual(claims, 0)
+        self.assertTrue(result.startswith("error: expected one Daily Gift card"), result)
+        self.assertFalse(bot.is_transient(result))
+
+    def test_a_hidden_duplicate_card_does_not_block_the_real_one(self):
+        result, claims, _ = self.flow("hidden-template")
+        self.assertEqual(result, "claimed successfully")
+        self.assertEqual(claims, 1)
+
+    def test_same_day_submit_latch_does_not_click_again(self):
+        with tempfile.TemporaryDirectory() as directory:
+            latch = Path(directory) / "submit-latch.json"
+            latch.write_text(
+                json.dumps({"submitted_at": datetime.now(timezone.utc).isoformat()}),
+                encoding="utf-8",
+            )
+            result, claims, _ = self.flow("unclaimed", latch)
+        self.assertEqual(claims, 0)
+        self.assertEqual(result, bot.SUBMIT_ALREADY_RECORDED)
+        self.assertFalse(bot.is_transient(result))
+        self.assertNotIn("TimeoutError", result)
+
+    def test_previous_day_latch_still_allows_one_claim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            latch = Path(directory) / "submit-latch.json"
+            previous = datetime.now(timezone.utc) - timedelta(days=2)
+            latch.write_text(
+                json.dumps({"submitted_at": previous.isoformat()}),
+                encoding="utf-8",
+            )
+            result, claims, _ = self.flow("unclaimed", latch)
+            recorded = json.loads(latch.read_text(encoding="utf-8"))
+        self.assertEqual(result, "claimed successfully")
+        self.assertEqual(claims, 1)
+        stamp = datetime.fromisoformat(recorded["submitted_at"])
+        self.assertEqual(bot.toronto_day(stamp), bot.toronto_day(datetime.now(timezone.utc)))
+
+    def test_claim_is_not_clicked_when_the_latch_cannot_be_recorded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            blocker = Path(directory) / "not-a-directory"
+            blocker.write_text("x", encoding="utf-8")
+            result, claims, _ = self.flow("unclaimed", blocker / "submit-latch.json")
+        self.assertEqual(claims, 0)
+        self.assertEqual(result, "error: could not record claim submit")
+        self.assertFalse(bot.is_transient(result))
 
 
 if __name__ == "__main__":

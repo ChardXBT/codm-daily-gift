@@ -95,6 +95,42 @@ class RetryTests(unittest.TestCase):
         self.assertTrue(bot.is_transient("error: TimeoutError at player_id"))
         self.assertFalse(bot.is_transient("error: Claim Gift button not found"))
 
+    def test_retry_waits_the_full_delay(self):
+        sleeps = []
+        remaining = ["error: TimeoutError at store", "already claimed"]
+
+        def fake_run():
+            return remaining.pop(0)
+
+        with (
+            patch.object(bot, "run", fake_run),
+            patch.object(bot.time, "sleep", sleeps.append),
+        ):
+            result = bot.run_with_retries()
+        self.assertEqual(result, "already claimed")
+        self.assertEqual(sleeps, [bot.RETRY_DELAY_SECONDS])
+
+    def test_pacing_constants_stay_at_their_guards(self):
+        self.assertEqual(bot.RUN_ATTEMPTS, 3)
+        self.assertEqual(bot.RETRY_DELAY_SECONDS, 45)
+        self.assertEqual(bot.CLAIM_STATE_SETTLE_MS, 8000)
+        self.assertEqual(bot.CARD_VISIBLE_TIMEOUT_MS, 15000)
+
+    def test_a_pre_submit_transport_failure_is_retried(self):
+        calls, result = self.run_with(
+            ["error: Exception at store transport", "already claimed"]
+        )
+        self.assertEqual(calls, 2)
+        self.assertEqual(result, "already claimed")
+
+    def test_a_post_submit_claim_timeout_line_is_not_retried(self):
+        calls, result = self.run_with(
+            ["error: ClaimTimeout at claim_submit"]
+        )
+        self.assertEqual(calls, 1)
+        self.assertEqual(result, "error: ClaimTimeout at claim_submit")
+        self.assertNotIn("TimeoutError", result)
+
 
 if __name__ == "__main__":
     unittest.main()
