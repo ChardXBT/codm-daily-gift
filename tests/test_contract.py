@@ -67,31 +67,33 @@ class TorontoDayTests(unittest.TestCase):
 
 class FailureLineTests(unittest.TestCase):
     def test_post_submit_timeout_omits_the_supervisor_retry_token(self):
-        line = bot.failure_line(TimeoutError("Timeout 30000ms exceeded"), "claim_submit")
+        result = bot.failure_line(TimeoutError("Timeout 30000ms exceeded"), "claim_submit")
+        line = result.line
         self.assertTrue(line.startswith("error:"))
         self.assertIn("claim_submit", line)
         self.assertNotIn("TimeoutError", line)
-        self.assertFalse(bot.is_transient(line))
+        self.assertFalse(bot.is_transient(result))
         for marker in bot.SUPERVISOR_TRANSIENT_MARKERS:
             self.assertNotIn(marker, line)
 
     def test_verification_timeout_is_also_a_hard_failure_line(self):
-        line = bot.failure_line(TimeoutError("timed out"), "claim_verification")
-        self.assertNotIn("TimeoutError", line)
-        self.assertFalse(bot.is_transient(line))
+        result = bot.failure_line(TimeoutError("timed out"), "claim_verification")
+        self.assertNotIn("TimeoutError", result.line)
+        self.assertFalse(bot.is_transient(result))
 
     def test_pre_submit_timeout_keeps_the_supervisor_retry_token(self):
-        line = bot.failure_line(TimeoutError("Timeout 60000ms exceeded"), "store")
-        self.assertEqual(line, "error: TimeoutError at store")
-        self.assertTrue(bot.is_transient(line))
+        result = bot.failure_line(TimeoutError("Timeout 60000ms exceeded"), "store")
+        self.assertEqual(result.line, "error: TimeoutError at store")
+        self.assertTrue(bot.is_transient(result))
 
     def test_disconnect_keeps_the_marker_and_drops_the_player_id(self):
         exc = Exception("net::ERR_INTERNET_DISCONNECTED while filling 9990001")
-        line = bot.failure_line(exc, "store", uid="9990001")
+        result = bot.failure_line(exc, "store", uid="9990001")
+        line = result.line
         self.assertIn("net::ERR_INTERNET_DISCONNECTED", line)
         self.assertNotIn("9990001", line)
         self.assertNotIn("filling", line)
-        self.assertTrue(bot.is_transient(line))
+        self.assertTrue(bot.is_transient(result))
 
     def test_authority_and_blocked_tokens_are_not_copied_into_the_log(self):
         for message in (
@@ -99,14 +101,15 @@ class FailureLineTests(unittest.TestCase):
             "net::ERR_BLOCKED_BY_CLIENT",
         ):
             with self.subTest(message=message):
-                line = bot.failure_line(Exception(message), "player_id", uid="9990001")
+                result = bot.failure_line(Exception(message), "player_id", uid="9990001")
+                line = result.line
                 lowered = line.lower()
                 self.assertNotIn("authority", lowered)
                 self.assertNotIn("blocked", lowered)
                 self.assertNotIn("auth", lowered)
                 self.assertNotIn("9990001", line)
                 self.assertTrue(line.endswith(" transport"))
-                self.assertTrue(bot.is_transient(line))
+                self.assertTrue(bot.is_transient(result))
 
     def test_store_detail_cannot_inject_a_log_line_or_a_secret(self):
         detail = bot.logged_store_error(
@@ -135,10 +138,10 @@ class RunFailureTests(unittest.TestCase):
             patch.object(bot, "claim_flow", fake_claim),
         ):
             result = bot.run()
-        self.assertTrue(result.startswith("error:"), result)
-        self.assertIn("claim_submit", result)
-        self.assertNotIn("TimeoutError", result)
-        self.assertNotIn("click timed out", result)
+        self.assertTrue(result.line.startswith("error:"), result)
+        self.assertIn("claim_submit", result.line)
+        self.assertNotIn("TimeoutError", result.line)
+        self.assertNotIn("click timed out", result.line)
         self.assertFalse(bot.is_transient(result))
         playwright.chromium.launch.assert_called_once_with(headless=True)
         browser.close.assert_called_once()
@@ -154,14 +157,14 @@ class RunFailureTests(unittest.TestCase):
             patch.object(bot, "load_uid", return_value="9990001"),
         ):
             result = bot.run()
-        self.assertIn("net::ERR_INTERNET_DISCONNECTED", result)
-        self.assertNotIn("9990001", result)
+        self.assertIn("net::ERR_INTERNET_DISCONNECTED", result.line)
+        self.assertNotIn("9990001", result.line)
         self.assertTrue(bot.is_transient(result))
         browser.close.assert_called_once()
 
     def test_browser_close_failure_does_not_discard_a_confirmed_claim(self):
         def fake_claim(page, uid, stage_ref, latch_path=None):
-            return "claimed successfully"
+            return bot.RunResult.claimed()
 
         manager, _, _ = _playwright(close_error=RuntimeError("close failed"))
         with (
@@ -170,7 +173,7 @@ class RunFailureTests(unittest.TestCase):
             patch.object(bot, "claim_flow", fake_claim),
         ):
             result = bot.run()
-        self.assertEqual(result, "claimed successfully")
+        self.assertEqual(result.line, "claimed successfully")
 
     def test_a_launch_failure_is_a_logged_startup_error(self):
         manager, _, _ = _playwright(launch_error=RuntimeError("missing browser"))
@@ -179,9 +182,9 @@ class RunFailureTests(unittest.TestCase):
             patch.object(bot, "load_uid", return_value="123456"),
         ):
             result = bot.run()
-        self.assertIn("startup", result)
-        self.assertTrue(result.startswith("error:"), result)
-        self.assertNotIn("missing browser", result)
+        self.assertIn("startup", result.line)
+        self.assertTrue(result.line.startswith("error:"), result)
+        self.assertNotIn("missing browser", result.line)
         self.assertFalse(bot.is_transient(result))
 
 
@@ -217,11 +220,16 @@ class MainContractTests(unittest.TestCase):
             self.assertEqual(body.group("body"), "Add UID UWU")
 
     def test_only_the_supervisor_success_phrases_exit_zero(self):
+        # A success kind can only carry its exact Supervisor phrase.
+        with self.assertRaises(ValueError):
+            bot.RunResult(bot.ResultKind.CLAIMED, "GIFT CLAIMED")
+        # A bare string (the old protocol) is refused, logged as a startup
+        # failure and exits 1 rather than being trusted.
         with tempfile.TemporaryDirectory() as directory:
             log, lock = self._paths(directory)
             with (
                 patch.object(bot, "load_uid", return_value="player-test"),
-                patch.object(bot, "run_with_retries", return_value="GIFT CLAIMED"),
+                patch.object(bot, "run_with_retries", return_value="claimed successfully"),
                 patch.object(bot, "LOG_FILE", log),
                 patch.object(bot, "LOCK_PATH", lock),
                 patch.object(bot, "git_push_log"),
@@ -233,13 +241,15 @@ class MainContractTests(unittest.TestCase):
                     bot.main()
             self.assertEqual(caught.exception.code, 1)
             self.assertNotIn("PASS check inboxie UWU", log.read_text(encoding="utf-8"))
+            last = LOG_LINE.match(log.read_text(encoding="utf-8").splitlines()[-1])
+            self.assertEqual(last.group("body"), "error: TypeError at startup")
 
     def test_a_real_success_exits_zero_and_prints_the_pass_line(self):
         with tempfile.TemporaryDirectory() as directory:
             log, lock = self._paths(directory)
             with (
                 patch.object(bot, "load_uid", return_value="player-test"),
-                patch.object(bot, "run_with_retries", return_value="claimed successfully"),
+                patch.object(bot, "run_with_retries", return_value=bot.RunResult.claimed()),
                 patch.object(bot, "LOG_FILE", log),
                 patch.object(bot, "LOCK_PATH", lock),
                 patch.object(bot, "git_push_log"),
@@ -302,7 +312,7 @@ class MainContractTests(unittest.TestCase):
             lock.write_text(json.dumps({"pid": 2_000_000_000}), encoding="utf-8")
             with (
                 patch.object(bot, "load_uid", return_value="player-test"),
-                patch.object(bot, "run_with_retries", return_value="already claimed"),
+                patch.object(bot, "run_with_retries", return_value=bot.RunResult.already_claimed()),
                 patch.object(bot, "LOG_FILE", log),
                 patch.object(bot, "LOCK_PATH", lock),
                 patch.object(bot, "git_push_log"),
@@ -323,7 +333,7 @@ class MainContractTests(unittest.TestCase):
         before = log.read_text(encoding="utf-8")
         with (
             patch.object(bot, "load_uid", return_value="player-test"),
-            patch.object(bot, "run_with_retries", return_value="already claimed"),
+            patch.object(bot, "run_with_retries", return_value=bot.RunResult.already_claimed()),
             patch.object(bot, "LOG_FILE", log),
             patch.object(bot, "LOCK_PATH", lock),
             patch.object(bot, "git_push_log"),

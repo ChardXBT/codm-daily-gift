@@ -119,29 +119,30 @@ class ClaimFlowTests(unittest.TestCase):
         stage = ["store"]
         with patch.object(bot, "CLAIM_STATE_SETTLE_MS", 3000):
             result = bot.claim_flow(page, "123", stage, latch_path=latch)
+        self.assertIsInstance(result, bot.RunResult)
         return result, page.evaluate("window.claims"), stage[0]
 
     def test_unclaimed_gift_is_claimed_once_and_verified(self):
         result, claims, _ = self.flow("unclaimed")
-        self.assertEqual(result, "claimed successfully")
+        self.assertEqual(result.line, "claimed successfully")
         self.assertEqual(claims, 1)
 
     def test_claim_state_that_renders_late_is_not_claimed_again(self):
         # 2026-09-23 01:56: the card still said CLAIM GIFT when checked,
         # the bot clicked it, and the run died at claim_dialog.
         result, claims, _ = self.flow("late-claimed")
-        self.assertEqual(result, "already claimed")
+        self.assertEqual(result.line, "already claimed")
         self.assertEqual(claims, 0)
 
     def test_dialog_that_already_says_claimed_is_not_submitted(self):
         result, claims, _ = self.flow("claimed-dialog-only")
-        self.assertEqual(result, "already claimed")
+        self.assertEqual(result.line, "already claimed")
         self.assertEqual(claims, 0)
 
     def test_store_rejection_is_reported_not_retried(self):
         result, claims, stage = self.flow("rejected")
-        self.assertTrue(result.startswith("error: store rejected claim"), result)
-        self.assertIn("not eligible", result)
+        self.assertTrue(result.line.startswith("error: store rejected claim"), result)
+        self.assertIn("not eligible", result.line)
         self.assertEqual(claims, 1)
         self.assertFalse(bot.is_transient(result))
         self.assertEqual(stage, "claim_verification")
@@ -151,21 +152,21 @@ class ClaimFlowTests(unittest.TestCase):
         # fake "claimed successfully" line would satisfy the Supervisor.
         result, claims, _ = self.flow("rejected-newline")
         self.assertEqual(claims, 1)
-        self.assertNotIn("\n", result)
-        self.assertNotIn("claimed successfully", result)
-        self.assertNotIn("TimeoutError", result)
-        self.assertTrue(result.startswith("error: store rejected claim"), result)
+        self.assertNotIn("\n", result.line)
+        self.assertNotIn("claimed successfully", result.line)
+        self.assertNotIn("TimeoutError", result.line)
+        self.assertTrue(result.line.startswith("error: store rejected claim"), result)
         self.assertFalse(bot.is_transient(result))
 
     def test_two_visible_daily_gift_cards_are_not_clicked(self):
         result, claims, _ = self.flow("two-cards")
         self.assertEqual(claims, 0)
-        self.assertTrue(result.startswith("error: expected one Daily Gift card"), result)
+        self.assertTrue(result.line.startswith("error: expected one Daily Gift card"), result)
         self.assertFalse(bot.is_transient(result))
 
     def test_a_hidden_duplicate_card_does_not_block_the_real_one(self):
         result, claims, _ = self.flow("hidden-template")
-        self.assertEqual(result, "claimed successfully")
+        self.assertEqual(result.line, "claimed successfully")
         self.assertEqual(claims, 1)
 
     def test_same_day_submit_latch_does_not_click_again(self):
@@ -177,9 +178,9 @@ class ClaimFlowTests(unittest.TestCase):
             )
             result, claims, _ = self.flow("unclaimed", latch)
         self.assertEqual(claims, 0)
-        self.assertEqual(result, bot.SUBMIT_ALREADY_RECORDED)
+        self.assertEqual(result.line, bot.SUBMIT_ALREADY_RECORDED)
         self.assertFalse(bot.is_transient(result))
-        self.assertNotIn("TimeoutError", result)
+        self.assertNotIn("TimeoutError", result.line)
 
     def test_previous_day_latch_still_allows_one_claim(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -191,7 +192,7 @@ class ClaimFlowTests(unittest.TestCase):
             )
             result, claims, _ = self.flow("unclaimed", latch)
             recorded = json.loads(latch.read_text(encoding="utf-8"))
-        self.assertEqual(result, "claimed successfully")
+        self.assertEqual(result.line, "claimed successfully")
         self.assertEqual(claims, 1)
         stamp = datetime.fromisoformat(recorded["submitted_at"])
         self.assertEqual(bot.toronto_day(stamp), bot.toronto_day(datetime.now(timezone.utc)))
@@ -202,7 +203,7 @@ class ClaimFlowTests(unittest.TestCase):
             blocker.write_text("x", encoding="utf-8")
             result, claims, _ = self.flow("unclaimed", blocker / "submit-latch.json")
         self.assertEqual(claims, 0)
-        self.assertEqual(result, "error: could not record claim submit")
+        self.assertEqual(result.line, "error: could not record claim submit")
         self.assertFalse(bot.is_transient(result))
 
 

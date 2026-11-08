@@ -90,6 +90,45 @@ git commit -m "clear log"
 git push
 ```
 
+## Supervisor contract
+
+An external supervisor decides each day's outcome by grepping `run.log`
+(case-insensitive regexes, one result line per run) and reading the exit
+code. These strings and codes are a wire contract: keep them byte-identical.
+`tests/test_state_machines.py` pins them (set `CODM_SUPERVISOR_ROOT` to a
+supervisor checkout to cross-check its `config.yaml` as well).
+
+| Supervisor reads | Value | Bot meaning |
+| --- | --- | --- |
+| success pattern | `claimed successfully`, `already claimed` | `ResultKind.CLAIMED` / `ALREADY_CLAIMED`, exit 0 |
+| failure pattern | `error:`, `Add UID UWU`, `Traceback (most recent call last):` | `ResultKind.FAILED` / `CONFIG_MISSING`, exit 1 |
+| transient pattern (relaunch) | `TimeoutError`, `net::ERR_INTERNET_DISCONNECTED`, `Could not resolve host`, `getaddrinfo failed` | only ever logged for a failure **before** the claim click |
+| attention words (latch) | `signin`, `sign-in`, `captcha`, `challenge`, `auth`, `session_expired`, `account_restricted`, `blocked` | store and exception text carrying these is withheld |
+| exit code | `0` / `1` / `75` | success / any other line / another run holds the lock (nothing logged) |
+
+The supervisor checks transient first, then attention, then failure, then
+success. A transient token after the claim click would relaunch the bot and
+click Claim a second time, so:
+
+- each run returns a `RunResult` (`kind`, `line`, `stage`, `stalled`).
+  Retryability and the exit code come from those fields, never from parsing
+  the line, and a post-submit result that carries a transient token cannot be
+  constructed;
+- every pipeline `Stage` declares its `SubmitPhase` (startup, pre-submit,
+  post-submit). A stage name outside the vocabulary is `Stage.UNKNOWN` and is
+  handled as post-submit;
+- the submit latch (`artifacts/submit-latch.json`) reads as `LatchState`.
+  Only a stamp from an earlier Toronto day is unarmed; a missing file is
+  unarmed; anything unreadable, legacy or future-dated is `ARMED_UNKNOWN` and
+  blocks the click for the day. A future-dated latch (a clock that ran ahead)
+  keeps blocking until that day arrives; after checking the in-game inbox,
+  delete `artifacts/submit-latch.json` by hand to clear it.
+
+Two log lines differ from older versions, both after the claim click only: an
+exception class whose name contains `TimeoutError` (for example
+`ConnectTimeoutError`) is logged as `ClaimTimeout`, and an undeclared stage
+is logged as `at unknown`. Both used to carry the Supervisor's retry token.
+
 ## Notes
 
 - Independent community project. Not affiliated with Activision, Call of Duty, or Coda Payments.

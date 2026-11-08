@@ -6,7 +6,9 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from enum import Enum, IntEnum
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -30,6 +32,7 @@ LATCH_PATH = Path(__file__).resolve().parent / "artifacts" / "submit-latch.json"
 LOCK_PATH = Path(__file__).resolve().parent / "artifacts" / "run.lock"
 # Phrases the Supervisor completion detector treats as success. Anything
 # else is a failed run (exit 1), including strings that merely lack "error".
+# Must equal {CLAIMED_LINE, ALREADY_CLAIMED_LINE} below (checked at import).
 SUCCESS_RESULTS = frozenset({"already claimed", "claimed successfully"})
 # The Supervisor reads run.log with these substrings. A line that contains
 # one is retried instead of latched as a code failure. They are copied from
@@ -53,13 +56,215 @@ SUPERVISOR_ATTENTION_FRAGMENTS = (
     "account_restricted",
     "blocked",
 )
-PRE_SUBMIT_STAGES = ("store", "player_id", "daily_gift_card", "claim_dialog")
-POST_SUBMIT_STAGES = ("claim_submit", "claim_verification")
+CLAIMED_LINE = "claimed successfully"
+ALREADY_CLAIMED_LINE = "already claimed"
+CONFIG_MISSING_LINE = "Add UID UWU"
+FAILURE_PREFIX = "error:"
+if SUCCESS_RESULTS != {CLAIMED_LINE, ALREADY_CLAIMED_LINE}:
+    raise RuntimeError("SUCCESS_RESULTS must be exactly the two success lines")
 SUBMIT_ALREADY_RECORDED = (
     "error: claim already submitted today; result still unverified"
 )
 WITHHELD_STORE_DETAIL = "store returned a detail withheld from the log"
 CARD_VISIBLE_TIMEOUT_MS = 15000
+
+
+class ExitCode(IntEnum):
+    """Process exit codes. Part of the Supervisor contract; values are fixed."""
+
+    OK = 0  # a SUCCESS_RESULTS line was logged
+    FAILED = 1  # any other logged line
+    BUSY = 75  # another claim run holds the lock; nothing logged, attempt refunded
+
+
+class SubmitPhase(Enum):
+    """Where a stage sits relative to the one irreversible claim click."""
+
+    STARTUP = "startup"  # no store page yet; nothing can have been claimed
+    PRE_SUBMIT = "pre_submit"  # no claim click yet; a stall is safe to retry
+    POST_SUBMIT = "post_submit"  # the click may have reached the store
+
+
+class Stage(str, Enum):
+    """The claim pipeline, in order. Every stage declares its SubmitPhase."""
+
+    STARTUP = "startup"
+    STORE = "store"
+    PLAYER_ID = "player_id"
+    DAILY_GIFT_CARD = "daily_gift_card"
+    CLAIM_DIALOG = "claim_dialog"
+    CLAIM_SUBMIT = "claim_submit"
+    CLAIM_VERIFICATION = "claim_verification"
+    # A stage name outside this vocabulary. It may be after the click, so
+    # it is handled as post-submit: never retried, no retry token logged.
+    UNKNOWN = "unknown"
+
+
+STAGE_PHASES: dict[Stage, SubmitPhase] = {
+    Stage.STARTUP: SubmitPhase.STARTUP,
+    Stage.STORE: SubmitPhase.PRE_SUBMIT,
+    Stage.PLAYER_ID: SubmitPhase.PRE_SUBMIT,
+    Stage.DAILY_GIFT_CARD: SubmitPhase.PRE_SUBMIT,
+    Stage.CLAIM_DIALOG: SubmitPhase.PRE_SUBMIT,
+    Stage.CLAIM_SUBMIT: SubmitPhase.POST_SUBMIT,
+    Stage.CLAIM_VERIFICATION: SubmitPhase.POST_SUBMIT,
+    Stage.UNKNOWN: SubmitPhase.POST_SUBMIT,
+}
+if set(STAGE_PHASES) != set(Stage):
+    raise RuntimeError("every Stage must declare its SubmitPhase")
+# The only forward steps the pipeline takes. UNKNOWN is never a target.
+PIPELINE_ORDER = (
+    Stage.STARTUP,
+    Stage.STORE,
+    Stage.PLAYER_ID,
+    Stage.DAILY_GIFT_CARD,
+    Stage.CLAIM_DIALOG,
+    Stage.CLAIM_SUBMIT,
+    Stage.CLAIM_VERIFICATION,
+)
+# Legacy names for the two partitions, derived from STAGE_PHASES.
+PRE_SUBMIT_STAGES = tuple(
+    stage.value for stage in PIPELINE_ORDER
+    if STAGE_PHASES[stage] is SubmitPhase.PRE_SUBMIT
+)
+POST_SUBMIT_STAGES = tuple(
+    stage.value for stage in PIPELINE_ORDER
+    if STAGE_PHASES[stage] is SubmitPhase.POST_SUBMIT
+)
+
+
+def parse_stage(value: object) -> Stage:
+    """A Stage from a Stage or its name. Any other value is Stage.UNKNOWN."""
+    if isinstance(value, Stage):
+        return value
+    try:
+        return Stage(value)
+    except ValueError:
+        return Stage.UNKNOWN
+
+
+def stage_phase(stage: Stage) -> SubmitPhase:
+    if not isinstance(stage, Stage):
+        raise TypeError(f"not a Stage: {stage!r}")
+    return STAGE_PHASES[stage]
+
+
+def advance_stage(stage_ref: list, target: Stage) -> None:
+    """Move the pipeline exactly one step forward.
+
+    A step back (in particular from after the claim click to before it)
+    would make a post-submit failure look retryable, so it raises.
+    """
+    if target not in PIPELINE_ORDER:
+        raise ValueError(f"not a pipeline stage: {target!r}")
+    current = parse_stage(stage_ref[0])
+    if current not in PIPELINE_ORDER:
+        raise ValueError(f"cannot leave stage {current.value}")
+    if PIPELINE_ORDER.index(target) != PIPELINE_ORDER.index(current) + 1:
+        raise ValueError(
+            f"stage {current.value} cannot move to {target.value}"
+        )
+    stage_ref[0] = target
+
+
+def _has_transient_marker(text: str) -> bool:
+    # The Supervisor compiles its patterns with re.IGNORECASE.
+    lowered = text.lower()
+    return any(marker.lower() in lowered for marker in SUPERVISOR_TRANSIENT_MARKERS)
+
+
+class ResultKind(Enum):
+    CLAIMED = "claimed"
+    ALREADY_CLAIMED = "already_claimed"
+    CONFIG_MISSING = "config_missing"
+    FAILED = "failed"
+
+
+# The exact log line of each fixed-text kind. FAILED lines vary.
+RESULT_LINES = {
+    ResultKind.CLAIMED: CLAIMED_LINE,
+    ResultKind.ALREADY_CLAIMED: ALREADY_CLAIMED_LINE,
+    ResultKind.CONFIG_MISSING: CONFIG_MISSING_LINE,
+}
+
+
+@dataclass(frozen=True)
+class RunResult:
+    """The outcome of one claim run.
+
+    Retryability and the exit code are read from kind, stage and stalled,
+    never parsed back out of the line. The line is the exact text written
+    to run.log, which the Supervisor greps (see README, Supervisor contract).
+    """
+
+    kind: ResultKind
+    line: str
+    stage: Stage | None = None
+    stalled: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, ResultKind):
+            raise TypeError(f"not a ResultKind: {self.kind!r}")
+        if not isinstance(self.line, str) or self.line != one_line(self.line):
+            raise ValueError("a result line is one non-empty line")
+        if self.stage is not None and not isinstance(self.stage, Stage):
+            raise TypeError(f"not a Stage: {self.stage!r}")
+        if self.kind is ResultKind.FAILED:
+            if not self.line.startswith(FAILURE_PREFIX):
+                raise ValueError("a failure line starts with 'error:'")
+            if self.stage is None:
+                raise ValueError("a failure names its stage")
+        elif self.kind in RESULT_LINES:
+            if self.line != RESULT_LINES[self.kind]:
+                raise ValueError(f"{self.kind.value} must log {RESULT_LINES[self.kind]!r}")
+        else:
+            raise ValueError(f"unhandled ResultKind {self.kind!r}")
+        if self.stalled and (
+            self.kind is not ResultKind.FAILED
+            or stage_phase(self.stage) is not SubmitPhase.PRE_SUBMIT
+        ):
+            raise ValueError("only a pre-submit failure can be a retryable stall")
+        if (
+            self.stage is not None
+            and stage_phase(self.stage) is SubmitPhase.POST_SUBMIT
+            and _has_transient_marker(self.line)
+        ):
+            # The Supervisor would relaunch and the new process would
+            # click Claim again.
+            raise ValueError("a post-submit line must not carry a retry token")
+
+    @classmethod
+    def claimed(cls, stage: Stage | None = None) -> "RunResult":
+        return cls(ResultKind.CLAIMED, CLAIMED_LINE, stage)
+
+    @classmethod
+    def already_claimed(cls, stage: Stage | None = None) -> "RunResult":
+        return cls(ResultKind.ALREADY_CLAIMED, ALREADY_CLAIMED_LINE, stage)
+
+    @classmethod
+    def config_missing(cls) -> "RunResult":
+        return cls(ResultKind.CONFIG_MISSING, CONFIG_MISSING_LINE)
+
+    @classmethod
+    def failed(cls, line: str, stage: Stage, *, stalled: bool = False) -> "RunResult":
+        return cls(ResultKind.FAILED, one_line(line), stage, stalled)
+
+    @property
+    def succeeded(self) -> bool:
+        if self.kind in (ResultKind.CLAIMED, ResultKind.ALREADY_CLAIMED):
+            return True
+        if self.kind in (ResultKind.CONFIG_MISSING, ResultKind.FAILED):
+            return False
+        raise ValueError(f"unhandled ResultKind {self.kind!r}")
+
+    @property
+    def retryable(self) -> bool:
+        """Only a stall before the final Claim click is retried in-process."""
+        return self.stalled
+
+    @property
+    def exit_code(self) -> ExitCode:
+        return ExitCode.OK if self.succeeded else ExitCode.FAILED
 
 # The store is slow and occasionally stalls on a single step. The log
 # shows a TimeoutError at 02:46:40 and a clean "already claimed" 75
@@ -209,9 +414,44 @@ def git_push_log() -> None:
 # under 20 minutes for all three attempts). A lock older than this whose
 # holder cannot be proven to be the process that wrote it is abandoned.
 LOCK_UNVERIFIED_MAX_AGE_SECONDS = 3600
+# The holder creates the lock file before its pid write is visible. An
+# unreadable lock younger than this is a holder mid-write.
+LOCK_TORN_GRACE_SECONDS = 5
 
 
-def _windows_process_identity(pid: int) -> tuple[str, int | None]:
+class ProcessState(str, Enum):
+    ALIVE = "alive"
+    DEAD = "dead"
+    UNKNOWN = "unknown"  # a process may exist that we cannot inspect
+
+
+class LockState(Enum):
+    """What an existing run.lock says about its holder."""
+
+    TORN_FRESH = "torn_fresh"  # unreadable, younger than the grace period
+    TORN_STALE = "torn_stale"  # unreadable and older (a crash mid-write)
+    MALFORMED = "malformed"  # JSON that is not {"pid": positive int, ...}
+    OWN_PID = "own_pid"  # this process's pid
+    DEAD_HOLDER = "dead_holder"
+    REUSED_PID = "reused_pid"  # live pid, recorded creation time differs
+    LIVE_HOLDER = "live_holder"  # live pid, creation time matches
+    UNVERIFIED_LIVE = "unverified_live"  # live pid we cannot tie to the writer
+    UNVERIFIED_EXPIRED = "unverified_expired"  # same, but older than any real run
+
+
+# Lock states a new run may delete and replace. Every other state means a
+# claim run may still be active: exit 75 and log nothing.
+LOCK_STEALABLE = frozenset({
+    LockState.TORN_STALE,
+    LockState.MALFORMED,
+    LockState.DEAD_HOLDER,
+    LockState.REUSED_PID,
+    LockState.UNVERIFIED_EXPIRED,
+})
+LOCK_HELD = frozenset(LockState) - LOCK_STEALABLE
+
+
+def _windows_process_identity(pid: int) -> tuple[ProcessState, int | None]:
     """("alive" | "dead" | "unknown", creation time in 100 ns units).
 
     os.kill(pid, 0) is not a liveness probe on Windows: signal 0 is
@@ -243,11 +483,13 @@ def _windows_process_identity(pid: int) -> tuple[str, int | None]:
         error = ctypes.get_last_error()
         # 87: no process has this id. Anything else (5 = access denied)
         # means a process exists that we cannot inspect.
-        return ("dead", None) if error == 87 else ("unknown", None)
+        if error == 87:
+            return ProcessState.DEAD, None
+        return ProcessState.UNKNOWN, None
     try:
         wait_timeout = 0x102
         if kernel32.WaitForSingleObject(handle, 0) != wait_timeout:
-            return "dead", None
+            return ProcessState.DEAD, None
         created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
         if not kernel32.GetProcessTimes(
             handle,
@@ -256,29 +498,29 @@ def _windows_process_identity(pid: int) -> tuple[str, int | None]:
             ctypes.byref(kernel),
             ctypes.byref(user),
         ):
-            return "alive", None
-        return "alive", (created.dwHighDateTime << 32) | created.dwLowDateTime
+            return ProcessState.ALIVE, None
+        return ProcessState.ALIVE, (created.dwHighDateTime << 32) | created.dwLowDateTime
     finally:
         kernel32.CloseHandle(handle)
 
 
-def _process_identity(pid: object) -> tuple[str, int | None]:
+def _process_identity(pid: object) -> tuple[ProcessState, int | None]:
     if type(pid) is not int or pid <= 0 or pid > 0xFFFFFFFF:
-        return "dead", None
+        return ProcessState.DEAD, None
     if os.name == "nt":
         try:
             return _windows_process_identity(pid)
         except Exception:
             # ctypes failures are not OSError. Unknown keeps the lock until
             # it is old enough that no real claim run can still own it.
-            return "unknown", None
+            return ProcessState.UNKNOWN, None
     try:
         os.kill(pid, 0)
     except PermissionError:
-        return "unknown", None
+        return ProcessState.UNKNOWN, None
     except OSError:
-        return "dead", None
-    return "alive", None
+        return ProcessState.DEAD, None
+    return ProcessState.ALIVE, None
 
 
 class RunLock:
@@ -328,35 +570,54 @@ class RunLock:
         except OSError:
             return None
 
-    def _stale(self) -> bool:
+    def state(self) -> LockState:
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, ValueError):
-            # The holder creates the file before the pid write is visible.
             # An empty or half-written lock is live until it is a few
             # seconds old; a crash leaves it stealable after that.
             age = self._age_seconds()
-            return age is None or age > 5
+            if age is None or age > LOCK_TORN_GRACE_SECONDS:
+                return LockState.TORN_STALE
+            return LockState.TORN_FRESH
         if not isinstance(raw, dict):
-            return True
+            return LockState.MALFORMED
         pid = raw.get("pid")
         if type(pid) is not int or pid <= 0:
-            return True
+            return LockState.MALFORMED
         if pid == os.getpid():
-            return False
-        state, created = _process_identity(pid)
-        if state == "dead":
-            return True
+            return LockState.OWN_PID
+        process, created = _process_identity(pid)
+        if process is ProcessState.DEAD:
+            return LockState.DEAD_HOLDER
         recorded = raw.get("created")
-        if state == "alive" and type(recorded) is int and created is not None:
+        if (
+            process is ProcessState.ALIVE
+            and type(recorded) is int
+            and created is not None
+        ):
             # Same pid, different process: the holder died and Windows gave
             # its pid to someone else.
-            return recorded != created
+            if recorded != created:
+                return LockState.REUSED_PID
+            return LockState.LIVE_HOLDER
+        if process not in (ProcessState.ALIVE, ProcessState.UNKNOWN):
+            raise ValueError(f"unhandled ProcessState {process!r}")
         # A live pid we cannot tie to the writer (an older lock without a
         # creation time, or access denied). A real claim run is long over
         # once the lock is this old.
         age = self._age_seconds()
-        return age is None or age > LOCK_UNVERIFIED_MAX_AGE_SECONDS
+        if age is None or age > LOCK_UNVERIFIED_MAX_AGE_SECONDS:
+            return LockState.UNVERIFIED_EXPIRED
+        return LockState.UNVERIFIED_LIVE
+
+    def _stale(self) -> bool:
+        state = self.state()
+        if state in LOCK_STEALABLE:
+            return True
+        if state in LOCK_HELD:
+            return False
+        raise ValueError(f"unhandled LockState {state!r}")
 
     def holder_summary(self) -> str:
         try:
@@ -384,28 +645,60 @@ class RunLock:
             pass
 
 
+class LatchState(Enum):
+    """Whether a claim click was already armed for this Toronto day.
+
+    The latch file holds only {"submitted_at": <tz-aware ISO time>}; its
+    one writer (record_submit) only ever arms it, so the state is derived
+    from the file and the clock rather than stored.
+    """
+
+    UNARMED = "unarmed"  # no file, or a stamp from an earlier Toronto day
+    ARMED = "armed"  # a well-formed stamp from this Toronto day
+    # Unreadable, legacy or future-dated: the click may have been sent and
+    # the record of it cannot be trusted. Handled as armed (never re-claim).
+    ARMED_UNKNOWN = "armed_unknown"
+
+
+def latch_state(path: Path | None, now: datetime | None = None) -> LatchState:
+    if path is None or not path.exists():
+        return LatchState.UNARMED
+    now = now or datetime.now(timezone.utc)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return LatchState.ARMED_UNKNOWN
+        stamp = datetime.fromisoformat(str(raw["submitted_at"]))
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError):
+        return LatchState.ARMED_UNKNOWN
+    if stamp.tzinfo is None:
+        return LatchState.ARMED_UNKNOWN
+    try:
+        armed_day = toronto_day(stamp)
+        today = toronto_day(now)
+    except ValueError:
+        return LatchState.ARMED_UNKNOWN
+    if armed_day == today:
+        return LatchState.ARMED
+    if armed_day < today:
+        return LatchState.UNARMED
+    # Stamped on a later day than "now": a clock that was ahead or has
+    # been set back. Which day the click belongs to is unknown.
+    return LatchState.ARMED_UNKNOWN
+
+
 def submit_blocked(path: Path | None, now: datetime | None = None) -> bool:
     """True when a claim click was already armed for this Toronto day.
 
     A missing file does not block. A corrupt file blocks: the click may
     already have been sent and the record of that is unreadable.
     """
-    if path is None or not path.exists():
+    state = latch_state(path, now)
+    if state is LatchState.UNARMED:
         return False
-    now = now or datetime.now(timezone.utc)
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            return True
-        stamp = datetime.fromisoformat(str(raw["submitted_at"]))
-    except (OSError, UnicodeError, ValueError, KeyError, TypeError):
+    if state in (LatchState.ARMED, LatchState.ARMED_UNKNOWN):
         return True
-    if stamp.tzinfo is None:
-        return True
-    try:
-        return toronto_day(stamp) == toronto_day(now)
-    except ValueError:
-        return True
+    raise ValueError(f"unhandled LatchState {state!r}")
 
 
 def record_submit(path: Path, now: datetime | None = None) -> None:
@@ -448,8 +741,8 @@ def _looks_like_transport(exc: BaseException) -> bool:
     return any(needle in blob for needle in needles)
 
 
-def failure_line(exc: BaseException, stage: str, uid: str = "") -> str:
-    """One log-safe failure line.
+def failure_line(exc: BaseException, stage: Stage | str, uid: str = "") -> RunResult:
+    """One log-safe failure result.
 
     After the claim click, the line must not contain TimeoutError or any
     other Supervisor transient marker. Those markers make the Supervisor
@@ -457,26 +750,40 @@ def failure_line(exc: BaseException, stage: str, uid: str = "") -> str:
     The raw exception text is never copied: Playwright repeats the value
     that was just filled, and store errors can embed attention words.
     """
+    stage = parse_stage(stage)
+    phase = stage_phase(stage)
     name = type(exc).__name__
     markers = _safe_markers(exc)
-    if stage in POST_SUBMIT_STAGES:
+    stalled = False
+    transport = False
+    if phase is SubmitPhase.POST_SUBMIT:
         markers = []
-        if name == "TimeoutError":
+        # Any class name carrying a retry token (TimeoutError itself, or
+        # e.g. a ConnectTimeoutError) is renamed, not only the exact one.
+        if _has_transient_marker(name):
             name = "ClaimTimeout"
-    else:
+    elif phase in (SubmitPhase.PRE_SUBMIT, SubmitPhase.STARTUP):
         markers = [marker for marker in markers if marker != name]
-    parts = [f"error: {name} at {stage}", *markers]
-    if (
-        stage in PRE_SUBMIT_STAGES
-        and _looks_like_transport(exc)
-        and name != "TimeoutError"
-        and not markers
-    ):
+        if phase is SubmitPhase.PRE_SUBMIT:
+            transport = (
+                _looks_like_transport(exc)
+                and name != "TimeoutError"
+                and not markers
+            )
+            stalled = (
+                name == "TimeoutError"
+                or transport
+                or any(marker != "TimeoutError" for marker in markers)
+            )
+    else:
+        raise ValueError(f"unhandled SubmitPhase {phase!r}")
+    parts = [f"error: {name} at {stage.value}", *markers]
+    if transport:
         parts.append("transport")
     line = " ".join(parts)
     if uid and len(uid) >= 6 and uid in line:
         line = line.replace(uid, "[redacted]")
-    return one_line(line)
+    return RunResult.failed(line, stage, stalled=stalled)
 
 
 def _attention_or_contract_fragment(text: str) -> bool:
@@ -504,8 +811,10 @@ def logged_store_error(text: str, uid: str) -> str:
     return collapsed[:180]
 
 
-def is_success(result: str) -> bool:
-    return one_line(result) in SUCCESS_RESULTS
+def is_success(result: RunResult) -> bool:
+    if not isinstance(result, RunResult):
+        raise TypeError(f"not a RunResult: {type(result).__name__}")
+    return result.succeeded
 
 
 def wait_for_validation(page):
@@ -553,21 +862,16 @@ def is_claimed(card) -> bool:
     return CLAIMED_TEXT in text and CLAIM_GIFT_TEXT not in text
 
 
-def is_transient(result: str) -> bool:
-    """Retry only stalls that happened before the final Claim request."""
-    if not str(result).startswith("error:"):
-        return False
-    for stage in PRE_SUBMIT_STAGES:
-        if f" at {stage}" not in result:
-            continue
-        if result.startswith(f"error: TimeoutError at {stage}"):
-            return True
-        if result.endswith(" transport"):
-            return True
-        for marker in SUPERVISOR_TRANSIENT_MARKERS:
-            if marker != "TimeoutError" and marker in result:
-                return True
-    return False
+def is_transient(result: RunResult) -> bool:
+    """Retry only stalls that happened before the final Claim request.
+
+    Read from the structured result. A bare log string is refused: parsing
+    retryability back out of text is how a post-submit line that happened
+    to contain " at store" or " transport" could be retried.
+    """
+    if not isinstance(result, RunResult):
+        raise TypeError(f"not a RunResult: {type(result).__name__}")
+    return result.retryable
 
 
 def dialog_shows_claimed(dialog) -> bool:
@@ -617,12 +921,12 @@ def wait_for_claim_state(page, card) -> bool:
 def claim_flow(
     page,
     uid: str,
-    stage_ref: list[str],
+    stage_ref: list,
     latch_path: Path | None = None,
-) -> str:
+) -> RunResult:
     """Everything after the store page has loaded. stage_ref[0] names the
-    current step so a timeout can be reported (and retried) by stage."""
-    stage_ref[0] = "player_id"
+    current Stage so a timeout can be reported (and retried) by stage."""
+    advance_stage(stage_ref, Stage.PLAYER_ID)
     print("Entering Player ID...")
     uid_field = page.locator("#userId")
     uid_field.wait_for(state="visible", timeout=30000)
@@ -632,28 +936,30 @@ def claim_flow(
 
     wait_for_validation(page)
 
-    stage_ref[0] = "daily_gift_card"
+    advance_stage(stage_ref, Stage.DAILY_GIFT_CARD)
     print("Finding Daily Gift...")
     try:
         card = find_daily_gift_card(page)
     except LookupError as exc:
-        return f"error: {exc}"
+        return RunResult.failed(f"error: {exc}", Stage.DAILY_GIFT_CARD)
     card.wait_for(state="visible", timeout=15000)
 
     if wait_for_claim_state(page, card):
-        return "already claimed"
+        return RunResult.already_claimed(Stage.DAILY_GIFT_CARD)
 
     # A previous process armed the claim click and then died. Do not click
     # the card or the confirm button again today; the card settle above is
     # the only proof that is still safe to trust.
     if submit_blocked(latch_path):
-        return SUBMIT_ALREADY_RECORDED
+        return RunResult.failed(SUBMIT_ALREADY_RECORDED, Stage.DAILY_GIFT_CARD)
 
-    stage_ref[0] = "claim_dialog"
+    advance_stage(stage_ref, Stage.CLAIM_DIALOG)
     print("Opening claim dialog...")
     claim_el = card.get_by_text(CLAIM_GIFT_TEXT, exact=True)
     if claim_el.count() == 0:
-        return "error: Claim Gift button not found"
+        return RunResult.failed(
+            "error: Claim Gift button not found", Stage.CLAIM_DIALOG
+        )
     claim_el.first.scroll_into_view_if_needed()
     claim_el.first.click(force=True)
 
@@ -665,7 +971,7 @@ def claim_flow(
     claim_btn = dialog.locator("[data-testid='claim-button']")
     for _ in range(20):
         if dialog_shows_claimed(dialog):
-            return "already claimed"
+            return RunResult.already_claimed(Stage.CLAIM_DIALOG)
         if (claim_btn.count() and claim_btn.first.is_visible()
                 and claim_btn.first.is_enabled()):
             break
@@ -676,51 +982,58 @@ def claim_flow(
 
     # The click may reach the store even when Playwright times out.
     # From this point on, never submit again without external proof.
-    stage_ref[0] = "claim_submit"
+    advance_stage(stage_ref, Stage.CLAIM_SUBMIT)
     if latch_path is not None:
         try:
             record_submit(latch_path)
         except OSError:
-            return "error: could not record claim submit"
+            return RunResult.failed(
+                "error: could not record claim submit", Stage.CLAIM_SUBMIT
+            )
     print("Confirming claim...")
     claim_btn.first.click()
-    stage_ref[0] = "claim_verification"
+    advance_stage(stage_ref, Stage.CLAIM_VERIFICATION)
     for _ in range(30):
         if claim_confirmed(card, dialog):
-            return "claimed successfully"
+            return RunResult.claimed(Stage.CLAIM_VERIFICATION)
         error = dialog_error(dialog)
         if error:
             if "already claimed" in error.lower():
-                return "already claimed"
-            return f"error: store rejected claim: {logged_store_error(error, uid)}"
+                return RunResult.already_claimed(Stage.CLAIM_VERIFICATION)
+            return RunResult.failed(
+                f"error: store rejected claim: {logged_store_error(error, uid)}",
+                Stage.CLAIM_VERIFICATION,
+            )
         page.wait_for_timeout(1000)
-    return "error: Claim result unverified after submit"
+    return RunResult.failed(
+        "error: Claim result unverified after submit", Stage.CLAIM_VERIFICATION
+    )
 
 
-def run_with_retries() -> str:
+def run_with_retries() -> RunResult:
     for attempt in range(RUN_ATTEMPTS):
         result = run()
-        if "error" not in result or not is_transient(result):
+        if not is_transient(result):
             return result
         if attempt + 1 < RUN_ATTEMPTS:
-            print(f"{result}; retrying in {RETRY_DELAY_SECONDS}s "
+            print(f"{result.line}; retrying in {RETRY_DELAY_SECONDS}s "
                   f"({attempt + 2}/{RUN_ATTEMPTS})")
             time.sleep(RETRY_DELAY_SECONDS)
     return result
 
 
-def run() -> str:
+def run() -> RunResult:
     uid = load_uid()
     if not uid:
-        return "Add UID UWU"
-    stage_ref = ["startup"]
+        return RunResult.config_missing()
+    stage_ref: list = [Stage.STARTUP]
     print("Starting CODM Daily Gift bot...")
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
             try:
                 page = browser.new_page()
-                stage_ref[0] = "store"
+                advance_stage(stage_ref, Stage.STORE)
                 print("Opening store...")
                 page.goto(
                     STORE_URL, wait_until="domcontentloaded", timeout=60000
@@ -769,30 +1082,28 @@ def main() -> None:
         # while the holder is still claiming.
         print("another claim run is active")
         print(lock.holder_summary())
-        raise SystemExit(75)
-    code = 0
+        raise SystemExit(int(ExitCode.BUSY))
+    code = ExitCode.OK
     try:
         if not load_uid():
-            print("Add UID UWU")
-            log_result("Add UID UWU")
-            git_push_log()
-            code = 1
+            result = RunResult.config_missing()
+            print(result.line)
         else:
             try:
                 result = run_with_retries()
+                if not isinstance(result, RunResult):
+                    raise TypeError(f"not a RunResult: {type(result).__name__}")
             except Exception as exc:
-                result = failure_line(exc, "startup")
-            visible = one_line(result)
-            if is_success(visible):
+                result = failure_line(exc, Stage.STARTUP)
+            if is_success(result):
                 print("PASS check inboxie UWU")
-            else:
-                code = 1
-            log_result(visible)
-            git_push_log()
+        code = result.exit_code
+        log_result(result.line)
+        git_push_log()
     finally:
         lock.release()
-    if code:
-        raise SystemExit(code)
+    if code is not ExitCode.OK:
+        raise SystemExit(int(code))
 
 
 if __name__ == "__main__":
