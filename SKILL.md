@@ -12,10 +12,12 @@ No login or password is ever needed.
 - Use only `callofduty.com/redemption` and `store.callofdutymobile.com`. Anything asking for a
   password, sign-in, payment, download or "CP generator" is a scam, so skip it.
 - Quickly confirm with the user that the game is updated first. The redemption page warns that an outdated game can lose codes.
+- When you're done, close the tab or browser window you opened and stop any helper processes
+  (drivers, scripts) you started — don't leave them running.
 
 ## Redeem codes
 
-Every code needs a fresh 4-character image CAPTCHA, and you solve it. Fill in everything else,
+Every code needs a fresh 4-character image CAPTCHA (usually digits), and you solve it. Fill in everything else,
 read the image carefully, type the 4 characters and press SUBMIT yourself. If verification
 fails, wait 10 seconds, read the refreshed image and try again — up to 3 attempts per code.
 Focus on the CAPTCHA and aim to get it exactly right. Only if all 3 attempts fail, ask the
@@ -50,11 +52,13 @@ user to type the CAPTCHA and press SUBMIT.
 The result box keeps showing its last message after it closes, so don't take an old "Redeemed" as a new
 result. Finish with a table of each code and its result. Rewards arrive in the in-game mailbox.
 
-Browser notes: the fields are `#F_UID`, `#F_CDKEY` and `#F_VCODE`, the CAPTCHA image is `#val_code`,
-SUBMIT is the `#label_submit` link, Confirm is `#Confirm` and the result box's OK is `#btn_ok`. SUBMIT
-keeps a `btn_confirm_gray` class while it thinks the form is incomplete, and its click handler quietly
-returns — if pressing it does nothing, remove that class and click again. The confirmation and result
-boxes are plain divs, not ARIA dialogs, so don't rely on `role=dialog` to find them.
+Browser notes: the fields are `#F_UID`, `#F_CDKEY` and `#F_VCODE`, the CAPTCHA image is `#val_code`
+(its ↻ icon has alt `Refresh Icon`), SUBMIT is the `#label_submit` link, Confirm is `#Confirm` and
+OK is `#btn_ok` (it closes result and error popups alike). SUBMIT keeps a `btn_confirm_gray` class
+while it thinks the form is incomplete — filling fields by script may not clear it, and its click
+handler quietly returns, so if pressing it does nothing, remove that class and click again. The
+confirmation and result boxes are plain divs, not ARIA dialogs, so don't rely on `role=dialog` to
+find them.
 
 ## Daily Gift (UID only, no CAPTCHA)
 
