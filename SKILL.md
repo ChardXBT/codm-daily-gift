@@ -50,6 +50,12 @@ user to type the CAPTCHA and press SUBMIT.
 The result box keeps showing its last message after it closes, so don't take an old "Redeemed" as a new
 result. Finish with a table of each code and its result. Rewards arrive in the in-game mailbox.
 
+Browser notes: the fields are `#F_UID`, `#F_CDKEY` and `#F_VCODE`, the CAPTCHA image is `#val_code`,
+SUBMIT is the `#label_submit` link, Confirm is `#Confirm` and the result box's OK is `#btn_ok`. SUBMIT
+keeps a `btn_confirm_gray` class while it thinks the form is incomplete, and its click handler quietly
+returns — if pressing it does nothing, remove that class and click again. The confirmation and result
+boxes are plain divs, not ARIA dialogs, so don't rely on `role=dialog` to find them.
+
 ## Daily Gift (UID only, no CAPTCHA)
 
 1. Open `https://store.callofdutymobile.com/en-ca/codm`, type the UID into the Player ID field and continue.
