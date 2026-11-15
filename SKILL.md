@@ -15,6 +15,25 @@ No login or password is ever needed.
 - When you're done, close the tab or browser window you opened and stop any helper processes
   (drivers, scripts) you started — don't leave them running.
 
+## Pick a working browser
+
+`www.callofduty.com` sits behind bot management that silently hangs non-real browsers: the
+connection completes and the server simply never sends the page. Bundled headless Chromium
+and plain HTTP clients (curl, requests) time out with zero bytes — retrying won't help.
+
+- Use an installed real browser: Playwright `chromium.launch(channel="chrome", headless=False)`
+  or `channel="msedge"` in headed mode, with `--disable-blink-features=AutomationControlled`.
+  Or drive a browser the user already has open via CDP attach or a desktop/browser tool.
+- Navigate with `wait_until="commit"`, then `wait_for_selector("#F_UID")` — `load` and
+  `domcontentloaded` can time out while the page is actually fine. If anything seems
+  stuck, screenshot and look at it before declaring the load failed.
+- No way to hold an interactive browser? Run `redeem_driver.py` from this repo — it keeps
+  one real-Chrome page alive and takes one-line commands through
+  `artifacts/redeem-session/cmd.txt` (`fill CODE`, `answer XXXX`, `confirm`, `ok`,
+  `reshot`, `nav`, `shot`, `quit`), reporting state in `status.json` and screenshots
+  (`captcha.png`, `dialog.png`, `result.png`). The CAPTCHA below only exists inside that
+  open page.
+
 ## Redeem codes
 
 Every code needs a fresh 4-character image CAPTCHA (usually digits), and you solve it. Fill in everything else,
@@ -32,8 +51,14 @@ user to type the CAPTCHA and press SUBMIT.
    SUBMIT stays grayed out until all three fields are filled.
 3. Type the UID as text and check the field holds exactly the same digits. It's a number field,
    so make sure nothing was rounded. Type the code with no spaces.
-4. **CAPTCHA step:** solve the image and press SUBMIT, as described above — 3 tries, 10 seconds
-   apart, then hand to the user.
+4. **CAPTCHA step:** click the ↻ refresh icon, wait ~1.5 s for the new image, then screenshot just
+   the `#val_code` element (~87x42 px) — a tight crop reads far better than a full-page grab.
+   Solve it and press SUBMIT as described above — 3 tries, 10 seconds apart, then hand to the user.
+   The answer is bound to the live page that showed the image: never close or reload the page
+   between reading it and submitting. Expect occasional misreads on 0/6/9, 8/0 and the noise
+   strokes through 4/7. A "Verification code error" popup only means the read was wrong — dismiss
+   it with `#btn_ok`; the UID and code fields keep their values, so just refresh the image and
+   re-enter the verification field.
 5. A **Confirmation** box shows the account's **nickname and UID**. Check that the UID matches. If you
    haven't seen this account before, quickly confirm with the user that the nickname is theirs. Then press **Confirm**.
 6. Read the result box, then close it before the next code. Each code needs a new CAPTCHA,
@@ -58,7 +83,9 @@ OK is `#btn_ok` (it closes result and error popups alike). SUBMIT keeps a `btn_c
 while it thinks the form is incomplete — filling fields by script may not clear it, and its click
 handler quietly returns, so if pressing it does nothing, remove that class and click again. The
 confirmation and result boxes are plain divs, not ARIA dialogs, so don't rely on `role=dialog` to
-find them.
+find them. The page always shows an "UPDATE REQUIRED TO REDEEM" line — that's the standing
+warning to keep the game updated, not an error. After a code finishes, field values persist —
+overwrite them for the next code and refresh the CAPTCHA again; never reuse an old image.
 
 ## Daily Gift (UID only, no CAPTCHA)
 
